@@ -1,0 +1,1469 @@
+""" Se importan las librerías necesarias para la implementación y se inicializa el uso de la GPU."""
+import tensorflow as tf
+import numpy as np
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+from tensorflow.python.client import device_lib
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+sess = tf.Session(config=tf.ConfigProto(log_device_placement=True))
+
+gpus = tf.config.experimental.list_physical_devices('GPU')
+tf.config.experimental.set_visible_devices(gpus[0], 'GPU')
+device_lib.list_local_devices()
+print(gpus)
+
+
+print(tf.__version__)
+#from tensorflow.contrib.slim.python.slim.nets import resnet_v1
+#import tensorflow.contrib.slim as slim
+
+sess = tf.Session(config=tf.ConfigProto(log_device_placement=True))
+
+
+
+""" Clase en la que se inicializan los parámetros y se definen los métodos utilizados por la Glimpse Network (recibe glimpse y ubicación del glimpse y regresa un vector que combina el qué y el dónde de los glimpses para el entrenamiento."""
+class ConvGlimpseNetwork(object):
+    """ Takes image and previous glimpse location and outputs feature vector."""
+
+    def __init__(self, config, images_ph):
+        self.config = config
+        self.images_ph = images_ph
+        self.regularizer = tf.contrib.layers.l2_regularizer(scale=self.config.regularizer)
+        self.initializer = tf.truncated_normal_initializer()
+
+    def get_glimpse(self, loc):
+        loc = tf.stop_gradient(loc)
+        glimpse_size = self.config.glimpse_size
+        input_shape = self.config.input_shape
+        self.glimpse = tf.image.extract_glimpse(self.images_ph, [glimpse_size, glimpse_size], loc, centered=True,
+                                                normalized=True, name='extract_glimpse')
+        return self.glimpse
+
+    def __call__(self, loc):
+        glimpse_input = self.get_glimpse(loc)
+
+        with tf.variable_scope('glimpse_sensor', reuse=tf.AUTO_REUSE):
+            with tf.variable_scope('convolutions', reuse=tf.AUTO_REUSE):
+                # h, _ = resnet_v1.resnet_v1_101(glimpse_input, self.config.g_size, is_training=True)
+                # h = tf.nn.avg_pool(h, ksize=[1, 3, 3, 1], strides=[1, 3, 3, 1], padding='SAME')
+
+                h = tf.layers.conv2d(inputs=glimpse_input, filters=16, kernel_size=3, padding='SAME',
+                                     kernel_initializer=self.initializer, name="conv1", activation=tf.nn.relu)
+
+                h = tf.layers.conv2d(h, filters=16, kernel_size=3, padding='SAME', kernel_initializer=self.initializer,
+                                     name="conv2")
+
+                h = tf.layers.batch_normalization(h, training=True)
+
+                h = tf.nn.relu(h)
+
+                h = tf.nn.max_pool(h, ksize=[1, 3, 3, 1], strides=[1, 3, 3, 1], padding='SAME')
+
+                h = tf.layers.conv2d(h, filters=32, kernel_size=3, padding='SAME', kernel_initializer=self.initializer,
+                                     name="conv3", activation=tf.nn.relu)
+
+                h = tf.nn.max_pool(h, ksize=[1, 3, 3, 1], strides=[1, 3, 3, 1], padding='SAME')
+
+            h = tf.contrib.layers.flatten(h)
+
+        with tf.variable_scope('glimpse_sensor', reuse=tf.AUTO_REUSE):
+            with tf.variable_scope('fully_connected', reuse=tf.AUTO_REUSE):
+                with tf.variable_scope('combine', reuse=tf.AUTO_REUSE):
+                    h = tf.layers.dense(inputs=h, units=self.config.g_size, kernel_initializer=self.initializer)
+                    h = tf.layers.batch_normalization(h, training=True)
+                    h = tf.nn.relu(h)
+
+        with tf.variable_scope('location_encoder', reuse=tf.AUTO_REUSE):
+            l = tf.layers.dense(loc, units=self.config.hl_size, kernel_initializer=self.initializer)
+
+        with tf.variable_scope('combined_where_and_what', reuse=tf.AUTO_REUSE):
+            l = tf.layers.dense(l, units=self.config.g_size, kernel_initializer=self.initializer)
+
+        # combine
+        g = tf.nn.relu(h * l)
+
+        return g
+
+""" Clase que inicializa los parámetros y define el comportamiento de la Location Network (recibe la salida de la RNN y regresa el Location predicho para extraer el siguiente glimpse del parche con información significativa)."""
+class LocNet(object):
+    """ Location network.
+        Takes RNN output and produces the 2D mean for next location.
+    """
+
+    def __init__(self, config):
+        self.config = config
+        self.regularizer = tf.contrib.layers.l2_regularizer(scale=self.config.regularizer)
+        self.initializer = tf.contrib.layers.xavier_initializer()
+
+    def __call__(self, input):
+        with tf.variable_scope('loc'):
+            mean = tf.layers.dense(input, units=self.config.loc_dim, kernel_initializer=self.initializer,
+                                   activation=tf.nn.tanh)
+
+        loc = mean + tf.random_normal((tf.shape(input)[0], 2), stddev=0.001)
+        # loc = mean
+        # loc = tf.clip_by_value(loc, -1., 1.)
+
+        loc = tf.stop_gradient(loc)
+
+        return loc, mean
+
+
+import os
+import shutil
+""" Clase en la que se definen los hiperparámetros utilizados por la DRAM para llevar a cabo el entrenamiento."""
+class Config(object):
+
+    #/media/proyreinforce/f7de66f7-119c-4593-a8ab-02f75c636771/Database/prostate-cancer-grade-assessment/train_images
+    #/media/proyreinforce/f7de66f7-119c-4593-a8ab-02f75c636771/Database/panpatches_512level1
+    #/media/proyreinforce/f7de66f7-119c-4593-a8ab-02f75c636771/Database/train-_1_.xlsx
+    #/media/proyreinforce/f7de66f7-119c-4593-a8ab-02f75c636771/Database/LGGGBM_2
+    def __init__(self, source_path="/media/proyreinforce/f7de66f7-119c-4593-a8ab-02f75c636771/Database/prostate-cancer-grade-assessment/train_images",
+                 temp_path="/media/proyreinforce/f7de66f7-119c-4593-a8ab-02f75c636771/Database/panpatches1536level0b",
+                 label_path="/media/proyreinforce/f7de66f7-119c-4593-a8ab-02f75c636771/Database/train-_1_.xlsx",
+                 #label_path="/media/proyreinforce/f7de66f7-119c-4593-a8ab-02f75c636771/Database/train-_1_.xlsx",
+                 selected_features=['Study'],
+                 array_path="/media/proyreinforce/f7de66f7-119c-4593-a8ab-02f75c636771/Database/panpatches1536level0b",
+                 logdir="/media/proyreinforce/f7de66f7-119c-4593-a8ab-02f75c636771/Database/LGGGBM_2", #Aca se define el directorio del log
+                 #val_size=0.125, test_size=0.20, num_glimpses=16, eval_batch_size=24, test_batch_size=24, batch_size=24,
+                 val_size=0.01, test_size=0.02, num_glimpses=8, eval_batch_size=8, test_batch_size=8, batch_size=8,
+                 #input_shape=512, gpu="0", glimpse_size=32, patch_size=512, sampling_size_train=1,
+                 input_shape=1536, gpu="0", glimpse_size=96, patch_size=1536, sampling_size_train=1,
+                 sampling_size_val=1, sampling_size_test=1):
+
+        self.temp_path = temp_path
+        self.label_path = label_path
+        self.selected_features = selected_features
+        self.val_size = val_size
+        self.test_size = test_size
+        self.input_shape = input_shape
+
+        self.source_path = source_path
+        self.array_path = array_path
+        self.logdir = logdir
+
+        self.patch_size = patch_size
+
+        self.gpu = gpu
+
+        self.num_glimpses = num_glimpses
+        self.batch_size = batch_size
+        self.eval_batch_size = eval_batch_size
+        self.test_batch_size = test_batch_size
+
+        # glimpse network
+        self.glimpse_size = glimpse_size
+        self.bandwidth = glimpse_size ** 2
+        self.sensor_size = glimpse_size ** 2 * 3
+
+        self.hg_size = 1024
+        self.hl_size = 1024
+        self.loc_dim = 2
+        self.g_size = 2048
+        self.regularizer = 0.01
+
+        # training
+        #self.steps = 10000
+        self.steps = 10
+        self.lr_start = 0.001
+        self.lr_min = 0.0001
+
+        self.loc_std = 0.25
+        self.max_grad_norm = 5.
+        self.n_verbose = 1
+
+        # lstm
+        self.cell_output_size = 3072
+        self.cell_size = 3072
+        # self.cell_output_size = 2048
+        # self.cell_size = 2048
+        self.cell_out_size = self.cell_size
+
+        # task
+        self.num_classes = 2
+
+        self.sampling_size_train = sampling_size_train
+        self.sampling_size_val = sampling_size_val
+        self.sampling_size_test = sampling_size_test
+
+        if os.path.exists(self.logdir):
+            shutil.rmtree(self.logdir)
+            os.makedirs(self.logdir)
+        else:
+            os.makedirs(self.logdir)
+
+        return
+
+
+import matplotlib
+
+matplotlib.use('Agg')
+from multiprocessing import Pool
+import os
+import numpy as np
+import cv2
+from openslide import *
+from scipy.ndimage.morphology import binary_dilation
+import pandas as pd
+import shutil
+import matplotlib.pyplot as plt
+
+
+#def get_patches(patient_id, config):
+   # config.patch_size = 512
+   # if os.path.isdir("/home/proyreinforce/PycharmProjects/pythonProject/panpatches_512level0/%s" % patient_id):
+     #   print("sample already processed")
+    #    return
+   # if os.path.isdir("/home/proyreinforce/PycharmProjects/pythonProject/temp/%s" % patient_id):
+    #    shutil.rmtree("/home/proyreinforce/PycharmProjects/pythonProject/temp/%s" % patient_id)
+   # os.makedirs("/home/proyreinforce/PycharmProjects/pythonProject/temp/%s" % patient_id)
+   # img = OpenSlide("/home/proyreinforce/PycharmProjects/pythonProject/slides/%s.tiff" % patient_id)
+   # width, height = img.dimensions
+   # idx = 0
+   # for i in range(int(height / config.patch_size)):
+      #  print("iteration %d out of %d" % (i + 1, int(height / config.patch_size)))
+      #  for j in range(int(width / config.patch_size)):
+           # patch = img.read_region(location=(j * config.patch_size, i * config.patch_size), level=0,
+             #                       size=(config.patch_size, config.patch_size)).convert('RGB')
+            #array = np.array(patch)[:, :, :3]
+            #gray = cv2.cvtColor(array, cv2.COLOR_BGR2GRAY)
+           # ret, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+          #  thresh = binary_dilation(thresh, iterations=15)
+         #   ratio = np.mean(thresh)
+        #    if ret < 200 and ratio > 0.90:
+       #         patch.save("/home/proyreinforce/PycharmProjects/pythonProject1/temp/%s/%s.jpg" % (patient_id, idx))
+      #          idx += 1
+    #shutil.move("/home/proyreinforce/PycharmProjects/pythonProject1/temp/%s" % patient_id,
+     #           "/home/proyreinforce/PycharmProjects/pythonProject1/panpatches_512level0/%s" % patient_id)
+
+
+#def get_all_patches(config, processes=30):
+    #patient_ids = os.listdir("/home/proyreinforce/PycharmProjects/pythonProject/slides2/")
+    #patient_ids = [patient_id[:-4] for patient_id in patient_ids]
+    #p = Pool(processes)
+    #p.starmap(get_patches, [(patient_id, config) for patient_id in patient_ids])
+
+
+#config = Config()
+#get_all_patches(config)
+
+from multiprocessing import Pool
+import time
+import os
+from openslide import *
+import numpy as np
+import cv2
+from skimage import io
+from skimage.measure import label, regionprops
+import pandas as pd
+from tqdm import tqdm
+from PIL import Image
+
+import matplotlib
+
+matplotlib.use('agg')
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+""" Clase que se tiene en cuenta para el preprocesamiento de las imágenes, el cual se lleva a cabo para disminuir lo más que se pueda la complejidad computacional al momento de entrenar el modelo."""
+class Preprocess(object):
+
+    def get_ids(self, config):
+
+        self.config = config
+        patient_ids = os.listdir(self.config.source_path)
+        patient_ids = [patient_id[:-4] for patient_id in patient_ids]
+        target_ids = set(pd.read_excel(self.config.label_path, header=0, index_col=0).index)
+        ids = list(target_ids.intersection(patient_ids))
+
+        return ids
+
+    def tissue_segmentation(self, config, patient_id, save_segmentation=True, save_tissues=True, plot=False):
+
+        print(patient_id)
+
+        self.config = config
+        if os.path.isdir('%s/%s' % (self.config.temp_path, patient_id)):
+            print("Already processed")
+            return
+
+        os.makedirs('%s/Segmentation' % self.config.temp_path, exist_ok=True)
+
+        os.makedirs('%s/%s' % (self.config.temp_path, patient_id), exist_ok=True)
+        img, labeled = self.otsu_thresholding(config, patient_id)
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.imshow(img)
+        patches = []
+
+        for region_index, region in enumerate(regionprops(labeled)):
+
+            if region.area > ((img.shape[0] * img.shape[1]) // 100):
+                if region.area > 1000000:
+                    minr, minc, maxr, maxc = region.bbox
+                    patches.append(img[minr:maxr, minc:maxc])
+                    rect = mpatches.Rectangle((minc, minr), maxc - minc, maxr - minr,
+                                              fill=False, edgecolor='red', linewidth=1)
+                    ax.add_patch(rect)
+
+        ax.set_axis_off()
+        plt.tight_layout()
+
+        if save_segmentation == True:
+            plt.savefig('%s/Segmentation/%s.jpg' % (self.config.temp_path, patient_id))
+
+        if plot == True:
+            plt.show()
+
+        if save_tissues == True:
+            for c, patch in enumerate(patches):
+                if c:
+                    io.imsave('%s/%s/%s.jpg' % (self.config.temp_path, patient_id, c), patch)
+                else:
+                    pass
+        return
+
+    def otsu_thresholding(self, config, patient_id, plot=False, level=1):
+
+        self.config = config
+        img = OpenSlide("%s/%s.tiff" % (self.config.source_path, patient_id))
+        img = img.read_region(location=(0, 0), level=level, size=img.level_dimensions[level]).convert('RGB')
+        img = np.array(img)[:, :, :3]
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        ret, thresh = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        kernel_c = np.ones((75, 75), np.uint8)
+        closing = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel_c)
+        kernel_o = np.ones((75, 75), np.uint8)
+        opening = cv2.morphologyEx(closing, cv2.MORPH_OPEN, kernel_o)
+        labeled = label(opening)
+
+        if plot == True:
+            fig, ax = plt.subplots(2, 2, figsize=(8, 5), sharex=True, sharey=True)
+            ax0, ax1, ax2, ax3 = ax.ravel()
+            plt.tight_layout()
+
+            ax0.imshow(img)
+            ax0.set_title('Original')
+            ax0.axis('off')
+
+            ax1.imshow(gray, cmap=plt.cm.gray)
+            ax1.set_title('Gray')
+            ax1.axis('off')
+
+            ax2.imshow(thresh, cmap=plt.cm.gray)
+            ax2.set_title('Otsu')
+            ax2.axis('off')
+            ax3.imshow(closing, cmap=plt.cm.gray)
+            ax3.set_title('Opening/Closing')
+            ax3.axis('off')
+
+            plt.show()
+
+        return img, labeled
+
+    def get_all_tissue_segments(self, config, processes=30):
+
+        patient_ids = self.get_ids(config)
+        p = Pool(processes)
+        p.starmap(self.tissue_segmentation, [[config, patient_id] for patient_id in patient_ids])
+        print("Preprocessing done")
+
+""" Clase utilizada para llevarle a cabo el resize y re-dimensiones similares a a las imágenes que analiza el modelo."""
+class Resize(object):
+
+    def resize_image_with_crop_or_pad(self, image, config):
+
+        self.config = config
+
+        height, width, channels = image.shape
+
+        cropped = self.crop_to_bounding_box(image,
+                                            min(config.input_shape, height),
+                                            min(config.input_shape, width))
+
+        resized = self.pad_to_bounding_box(cropped, config.input_shape, config.input_shape)
+
+        return resized
+
+    def crop_to_bounding_box(self, image, target_height,
+                             target_width):
+
+        height, width, channels = image.shape
+
+        cropped = np.array(image)[(height - target_height) // 2: (height + target_height) // 2,
+                  (width - target_width) // 2: (width + target_width) // 2, :3]
+
+        return cropped
+
+    def pad_to_bounding_box(self, image, target_height,
+                            target_width):
+
+        height, width, channels = image.shape
+        img = np.zeros((target_height, target_width, 3), dtype=np.uint8) + 255
+
+        if (target_height - height) % 2 == 0:
+            lb_height = (target_height - height) // 2
+            ub_height = target_height - lb_height
+        else:
+            lb_height = (target_height - height) // 2 + 1
+            ub_height = target_height - lb_height + 1
+
+        if (target_width - width) % 2 == 0:
+            lb_width = (target_width - width) // 2
+            ub_width = target_width - lb_width
+        else:
+            lb_width = (target_width - width) // 2 + 1
+            ub_width = target_width - lb_width + 1
+
+        img[lb_height: ub_height, lb_width: ub_width] = image[:, :]
+
+        padded = img
+
+        return padded
+
+
+import os
+import numpy as np
+import pandas as pd
+from PIL import Image
+from sklearn.preprocessing import LabelBinarizer
+from sklearn.preprocessing import LabelEncoder
+from tqdm import tqdm
+from sklearn.model_selection import StratifiedShuffleSplit
+
+"""Clase utilizada para inicializar los parámetros y definir los métodos utilizados con base en el Dataset mediante el cual se entrena el modelo."""
+class Dataset(object):
+
+    def __init__(self, config):
+        self.config = config
+        self._list_features = self.list_features()
+        self._selected_features = self.output_data()
+        self._binarized_data, self.le_name_mapping = self.binarized_data()
+        self._ids = self.ids()
+        self._labels = self.labels()
+        self._partition = self.partition()
+
+    def list_features(self):
+        data = pd.read_excel(self.config.label_path, header=0, index_col=0)
+        list_features = data.columns
+        return list_features
+
+    def output_data(self):
+        data = pd.read_excel(self.config.label_path, header=0, index_col=0)
+        selected_features = data[self.config.selected_features].dropna()
+        return selected_features
+
+    def binarized_data(self):
+        data = self.output_data()
+        le = LabelEncoder()
+        binarized_data = data.apply(le.fit_transform)
+        le_name_mapping = dict(zip(le.classes_, le.transform(le.classes_)))
+        return binarized_data, le_name_mapping
+
+    def ids(self):
+        patient_ids = os.listdir(self.config.temp_path)
+        target_ids = set(self.output_data().index)
+        ids = list(target_ids.intersection(patient_ids))
+        return ids
+
+    def labels(self):
+        labels = {}
+        samples = self.ids()
+        data = self.binarized_data()[0]
+        for feature in self.config.selected_features:
+            labels[feature] = {}
+            for sample in samples:
+                labels[feature][sample] = data.loc[sample, feature]
+
+        return labels
+
+    def partition(self):
+        data = pd.DataFrame(self._labels)
+        ids = data.index
+        labels = data[self.config.selected_features].values
+
+        sss_test = StratifiedShuffleSplit(n_splits=1, test_size=self.config.test_size)
+        sss_test.get_n_splits(ids, labels)
+
+        for train_index, test_index in sss_test.split(ids, labels):
+            ids_train, ids_test = ids[train_index], ids[test_index]
+            y_train, y_test = labels[train_index], labels[test_index]
+
+        ids, labels = ids_train, y_train
+
+        sss_val = StratifiedShuffleSplit(n_splits=1, test_size=self.config.val_size)
+        sss_val.get_n_splits(ids, labels)
+
+        for train_index, test_index in sss_val.split(ids, labels):
+            ids_train, ids_val = ids[train_index], ids[test_index]
+            y_train, y_val = labels[train_index], labels[test_index]
+
+        print(self.le_name_mapping)
+
+        # for i in range(len(np.unique(y_val))):
+        #    print(i,len((y_val[y_val == i]))/len(y_val))
+        # for i in range(len(np.unique(y_train))):
+        #    print(i,len((y_train[y_train == i]))/len(y_train))
+
+        names = list(self.le_name_mapping)
+        y_val_split = []
+        y_train_split = []
+        y_test_split = []
+
+
+        for i in range(len(np.unique(y_val))):
+            y_val_split.append(len(y_val[y_val == i]))
+
+        for i in range(len(np.unique(y_train))):
+            y_train_split.append(len(y_train[y_train == i]))
+
+        for i in range(len(np.unique(y_train))):
+            y_test_split.append(len(y_test[y_test == i]))
+
+        split = pd.DataFrame(list(zip(y_train_split, y_val_split, y_test_split)), columns=['train', 'val', 'test'],
+                             index=names)
+        split.to_csv(self.config.logdir + '/train_val_split.csv')
+
+        partition_ids = {'train': list(ids_train), 'val': list(ids_val), 'test': list(ids_test)}
+        partition_labels = {'train': list(y_train), 'val': list(y_val), 'test': list(y_test)}
+        partition_labels = {'train': list(y_train), 'val': list(y_val), 'test': list(y_test)}
+
+        return partition_ids, partition_labels
+
+    def convert_to_arrays(self, samples, size=None):
+
+        Image.MAX_IMAGE_PIXELS = 1000000000
+
+        X, ids = [], []
+        y = []
+
+        for sample in samples:
+            try:
+                patches = os.listdir("%s/%s" % (self.config.temp_path, sample))
+
+                if size != None:
+                    patches = np.random.choice(patches, size=size, replace=True)
+
+                for patch in patches:
+                    ID = "%s/%s/%s" % (self.config.temp_path, sample, patch)
+                    ids.append(ID)
+                    img = Image.open(ID)
+                    img = np.array(img)[:, :, :3]
+                    X.append(img)
+            except Exception as e:
+                print(e)
+                pass
+
+        min_width = min([x.shape[1] for x in X])
+        min_height = min([x.shape[0] for x in X])
+        X = [x[:min_height, :min_width, :] for x in X]
+        X = np.asarray(X)
+
+        for label in self.labels().keys():
+            y_label = []
+            for ID in ids:
+                sample = ID.split('/')[-2]
+                y_label.append(self.labels()[label][sample])
+            y_label = np.asarray(y_label)
+            y.append(y_label)
+        y = np.asarray(y)
+        return X, y
+
+    def next_batch(self, images, labels, batch_size, step):
+        self._images = images
+        self._labels = labels
+        self._num_examples = images.shape[0]
+
+        start = step * batch_size
+        end = (step + 1) * batch_size
+        if end > self._num_examples:
+            pass
+        else:
+            return self._images[start:end], self._labels[start:end]
+
+import tensorflow as tf
+import os
+
+"""Clase utilizada para inicializar los parámetros y definir el Logger que será utilizado para poder visualizar de manera adecuada el proceso de entrenamiento y sus avances en tiempo real mientras se entrena la DRAM"""
+class Logger(object):
+
+    def __init__(self, log_dir="/home/proyreinforce/PycharmProjects/pythonProject/logger", sess=None, summary_ops={},
+                 var_list=[],
+                 global_step=None, eval_ops={}, n_verbose=10):
+
+        self.session = sess
+
+        # folders
+        self.log_dir = log_dir
+
+        self.checkpoint_path, self.summary_path = self.create_directories(log_dir)
+
+        # file writers
+        self.writers = {
+            'train': tf.summary.FileWriter(os.path.join(self.summary_path, 'train'), self.session.graph,
+                                           flush_secs=120),
+            'test': tf.summary.FileWriter(os.path.join(self.summary_path, 'test')),
+            'val': tf.summary.FileWriter(os.path.join(self.summary_path, 'val'))
+        }
+
+        # saver
+        self.global_step = global_step
+        if var_list == []:
+            self.saver = tf.train.Saver(keep_checkpoint_every_n_hours=0.0166667)
+        else:
+            self.saver = tf.train.Saver(var_list, keep_checkpoint_every_n_hours=0.0166667)
+
+        # summaries
+        self.summary_ops = summary_ops
+        self.eval_ops = eval_ops
+        self.merged_op = tf.summary.merge_all()
+
+        # step counter
+        self.step = 0
+        self.n_verbose = n_verbose
+
+    def log(self, writer_id, feed_dict):
+        """ Logs performance using either 'train', 'test' or 'val' writer"""
+        summaries = self.session.run(self.merged_op, feed_dict=feed_dict)
+        self.writers[writer_id].add_summary(summaries, self.step)
+
+    # print ('\n------ Step %s ------' % (self.step))
+
+    # for key in self.eval_ops.keys():
+    #    val = self.session.run(self.eval_ops[key],feed_dict)
+    #   print ('%s \t %s' %(key,val))
+
+    def create_directories(self, log_dir):
+
+        checkpoint_path = os.path.join(log_dir, 'checkpoints')
+        summary_path = os.path.join(log_dir, 'summaries')
+
+        if not os.path.exists(log_dir):
+            os.mkdir(log_dir)
+            os.mkdir(checkpoint_path)
+            os.mkdir(summary_path)
+
+        print('\n\nLogging to <<%s>>.\n\n' % log_dir)
+
+        return checkpoint_path, summary_path
+
+    def save(self):
+        self.saver.save(self.session, os.path.join(self.checkpoint_path, 'checkpoint'),
+                        global_step=self.global_step)
+    def restore(self, checkpoint_dir):
+        ckpt = tf.train.get_checkpoint_state(checkpoint_dir)
+        if ckpt and ckpt.model_checkpoint_path:
+            print(ckpt)
+            self.saver.restore(self.session, ckpt.model_checkpoint_path)
+
+
+import numpy as np
+import os
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+config = Config()
+plt.switch_backend('agg')
+
+
+
+
+"""Método utilizado para almacenar en el equipo la trayectoria de los glimpses predichos por el modelo por cada parche analizado durante el proceso de validación del modelo"""
+def plot_trajectories(trainStep, config=None, locations=[],
+                      X=[], labels=[], pred_labels=[],
+                      grid=[], file_name=[], bboxes=[], fontsize=5, alpha=0.5, step=None):
+    N, H, W, C = X.shape
+    n_glimpses = len(locations)
+
+    hw = W / 2.
+
+    if grid != []:
+        assert grid[0] * grid[1] == N
+
+    if grid == []:
+        n_rows = int(np.ceil(np.sqrt(N)))
+        n_cols = n_rows
+    else:
+        n_rows, n_cols = grid
+
+    fig, ax = plt.subplots(n_rows, n_cols)
+    print(ax)
+
+    pixel_locations = ((locations[:, :-1, :] + 1) * config.input_shape / 2.0).astype(int)
+
+    output_dir = file_name + '/val_%s' % (trainStep)
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    for i, cur_ax in enumerate(ax.flat):
+        if i < N:
+
+            cur_ax.imshow(X[i])
+            cur_ax.set_axis_off()
+
+            if len(labels) != 0:
+                cur_ax.set_title(('Truth %s | Pred %s') % (labels[i], pred_labels[i]))
+
+            cur_locations = np.squeeze(pixel_locations[i, :, :])  # all locations for current image
+
+            if pred_labels[i] == labels[i]:
+                color = 'limegreen'
+            else:
+                color = 'r'
+
+            cur_ax.plot(cur_locations[:, 1], cur_locations[:, 0], '-', color=color, linewidth=1.5, alpha=alpha)
+            cur_ax.scatter(cur_locations[0, 1], cur_locations[0, 0], 15, facecolors='none', linewidth=1.5, color=color,
+                           alpha=alpha)
+            cur_ax.plot(cur_locations[-1, 1], cur_locations[-1, 0], 'o', color=color, markersize=5, alpha=alpha)
+
+            if bboxes != []:
+                bbox = create_bbox([(bboxes[i, 1] + 1) * hw, (bboxes[i, 0] + 1) * hw, bboxes[i, 2], bboxes[i, 3]],
+                                   color=[1, 1, 1], alpha=0.3, linewidth=0.7)
+                cur_ax.add_patch(bbox)
+
+        else:
+            fig.delaxes(cur_ax)
+
+    plt.tight_layout(pad=0.2)
+
+    if file_name == []:
+        plt.show()
+
+    else:
+        png_name = file_name + '/val_%s/step_%s.png' % (trainStep, step)
+        plt.subplots_adjust(wspace=0.05, hspace=0.05)
+        plt.savefig(png_name, bbox_inches='tight')
+        plt.close()
+    return
+
+
+def add_glimpses(config, axis, loc, color='r', linewidth=1.5, alpha=1):
+    w = config.glimpse_size
+    hw = w / 2.0
+    box = [int(loc[1] - hw), int(loc[0] - hw), w, w]
+    axis.add_patch(create_bbox(box, color=color, linewidth=linewidth, alpha=alpha))
+    return
+
+
+def create_bbox(bb, color='red', linewidth=1.5, alpha=1.0):
+    return mpatches.Rectangle((bb[0], bb[1]), bb[2], bb[3],
+                              edgecolor=color, fill=False, linewidth=linewidth, alpha=alpha)
+
+
+def norm2ind(norm_ind, width):
+    return np.round(width * ((norm_ind + 1) / 2.0), 1)
+
+
+def ind2norm(ind, width):
+    return np.round((ind / float(width)) * 2 - 1, 1)
+
+
+import numpy as np
+#from keras.preprocessing.image import ImageDataGenerator
+
+"""Clase utilizada para inicializar los parámetros y los métodos usados para generar los batches de imágenes que se extraen del dataset para ser utilizados durante el proceso de entrenamiento del modelo"""
+class Generator(object):
+
+    def __init__(self, config, dataset):
+
+        self.config = config
+        self.dataset = dataset
+        self.batch_ids = []
+        self.training_ids = self.dataset._partition[0]['train']
+        self.training_labels = np.array(self.dataset._partition[1]['train']).flatten()
+        self.validation_ids = self.dataset._partition[0]['val']
+        self.validation_labels = np.array(self.dataset._partition[1]['val']).flatten()
+        self.test_ids = self.dataset._partition[0]['test']
+        self.test_labels = np.array(self.dataset._partition[1]['test']).flatten()
+        print('Training set has %s patients' % len(self.training_ids))
+
+    def generate(self, batch_size, labels, ids):
+        'Generates batches of samples'
+        self.t_indexes = {}
+        self.t_batches = {}
+
+        for i in range(self.config.num_classes):
+            self.t_indexes[i] = np.argwhere(labels == i).flatten()
+            self.t_batches[i] = np.array(labels)[self.t_indexes[i]].flatten()
+            imax = int(len(labels) / batch_size)
+
+        for j in range(imax):
+            indexes = np.concatenate([np.random.choice(self.t_indexes[i],
+                                                       int(batch_size / self.config.num_classes),
+                                                       replace=False) for i in range(self.config.num_classes)])
+            self.batch_labels = labels[indexes]
+            self.batch_ids = [ids[i] for i in indexes]
+            print("batchids")
+            print(self.batch_ids)
+            print(self.batch_labels)
+            X, y = self.__data_generation(self.batch_ids)
+            X = self.__data_augmentation(X)
+            return X, y
+
+    def __data_generation(self, list_IDs_temp):
+        X, y = self.dataset.convert_to_arrays(samples=list_IDs_temp, size=1)
+        return X, y
+
+    def __data_augmentation(self, X):
+        augmented_images = []
+        for i in range(len(X)):
+            x = X[i]
+            switch = np.random.randint(2)
+            k = np.random.randint(4)
+            if switch == 0:
+                x_rotated = np.rot90(x, k=k)
+                #X[i] = x_rotated
+            else:
+                if k == 0:
+                    x_flipped = x
+                if k == 1:
+                    x_flipped = np.fliplr(x)
+                if k == 2:
+                    x_flipped = np.fliplr(x)
+                if k == 3:
+                    x_flipped = x
+                X[i] = x_flipped
+        return X
+
+"""Método usado para guardar en el equipo los glimpses predichos por el modelo"""
+def plot_glimpses(config, id_val, glimpse_images, pred_labels, probs, sampled_loc,
+                  X, labels, file_name, trainStep, fontsize=5, keep=True, step=None):
+    N, H, W, C = X.shape
+    n_glimpses = config.num_glimpses
+
+    for i in range(N):
+
+            # Obtener el image_id del validation_ids correspondiente a esta iteración
+
+
+        cur_id_val = id_val[i]
+        print("id_valll")
+        print(id_val[i])
+        os.makedirs(file_name + '/val_%s/step_%s/image_%s' % (trainStep, step, cur_id_val))
+        cur_loc = sampled_loc[i, :, :]
+        cur_loc_norm = ((cur_loc + 1) * config.input_shape / 2.).astype(int)
+
+        for glimpseI in range(n_glimpses):
+
+            if probs == []:
+                fig, cur_ax = plt.subplots(1, 2)
+            else:
+                fig, cur_ax = plt.subplots(1, 3)
+
+            cur_ax[0].imshow(X[i])
+            cur_ax[0].set_title('Image %s' % i)
+            cur_ax[0].set_axis_off()
+
+            glimpses = glimpse_images[i, glimpseI]
+            glimpses = np.squeeze(glimpses).astype(int)
+            cur_ax[1].imshow(glimpses)
+            cur_ax[1].set_title('Glimpse %s' % glimpseI)
+            cur_ax[1].set_axis_off()
+
+            if probs != []:
+                if glimpseI < n_glimpses:
+                    cur_ax[2].bar(range(config.num_classes), probs[i, glimpseI, :], color='b')
+                    cur_ax[2].set_aspect(3)
+                    cur_ax[2].set_ylim((0, 1))
+                    cur_ax[2].set_xticks(range(config.num_classes))
+                    cur_ax[2].set_xlabel('Digit')
+                    cur_ax[2].set_title('Probabilities')
+
+                if np.argmax(probs[i, glimpseI, :]) == labels[i]:
+                    color = 'limegreen'
+                else:
+                    color = 'r'
+
+            else:  # use predicted labels
+                if pred_labels[i] == labels[i]:
+                    color = 'limegreen'
+                else:
+                    color = 'r'
+
+            if glimpseI == n_glimpses - 1:
+                linewidth = 6.0
+            else:
+                linewidth = 3.0
+
+            if keep:
+                alpha_step = 1.0 / n_glimpses
+                alpha = 0.0
+                for h in range(glimpseI + 1):
+                    alpha += alpha_step
+                    alpha = min(alpha, 1.0)
+                    add_glimpses(config, axis=cur_ax[0], loc=cur_loc_norm[h, :], color=color, linewidth=linewidth,
+                                 alpha=alpha)
+
+                    add_glimpses(config, axis=cur_ax[1], loc=[config.glimpse_size / 2, config.glimpse_size / 2],
+                                 color=color, linewidth=7, alpha=0.75)
+
+            png_name = file_name + '/val_%s/step_%s/image_%s/glimpse_%s.png' % (trainStep, step, cur_id_val, glimpseI)
+            plt.subplots_adjust(wspace=0.01, hspace=0.01)
+            plt.savefig(png_name, bbox_inches='tight')
+            plt.close()
+
+    return
+
+import tensorflow as tf
+import pandas as pd
+import shutil
+import os
+from tqdm import tqdm
+from sklearn.metrics import accuracy_score, average_precision_score, precision_recall_curve, roc_curve, auc, \
+    roc_auc_score
+from sklearn.metrics import accuracy_score, precision_score, f1_score, recall_score
+from sklearn.preprocessing import label_binarize
+import numpy as np
+import matplotlib.pyplot as plt
+#from scipy import interp
+from itertools import cycle
+
+"""Clase que define la DRAM y el proceso de entrenamiento a realizarse, unificando la gran mayoría de los métodos descritos en este script."""
+class DRAM(object):
+
+    def __init__(self, config):
+        self.config = config
+        self.data_init()
+        self.model_init()
+
+    def data_init(self):
+        print("\nData init")
+        self.dataset = Dataset(self.config)
+        self.generator = Generator(self.config, self.dataset)
+
+    def model_init(self):
+
+        self.rnn_cell = tf.contrib.rnn
+        self.config = config
+        self.regularizer = tf.contrib.layers.l2_regularizer(scale=self.config.regularizer)
+        self.initializer = tf.contrib.layers.xavier_initializer()
+        self.images_ph = tf.placeholder(tf.float32, [None, self.config.input_shape, self.config.input_shape, 3])
+        self.labels_ph = tf.placeholder(tf.int64, [None])
+        self.N = tf.shape(self.images_ph)[0]
+
+        # ------- GlimpseNet / LocNet -------
+
+        with tf.variable_scope('glimpse_net'):
+            self.gl = ConvGlimpseNetwork(self.config, self.images_ph)
+
+        with tf.variable_scope('loc_net'):
+            self.loc_net = LocNet(self.config)
+
+        self.init_loc = tf.zeros(shape=[self.N, 2], dtype=tf.float32)
+        with tf.variable_scope("rnn_decoder/loop_function", reuse=tf.AUTO_REUSE):
+            self.init_glimpse = self.gl(self.init_loc)
+
+        self.inputs = [self.init_glimpse]
+        self.inputs.extend([0] * (self.config.num_glimpses - 1))
+
+        # ------- Recurrent network -------
+
+        def get_next_input(output, i):
+
+            loc, loc_mean = self.loc_net(output)
+            gl_next = self.gl(loc)
+
+            self.loc_mean_arr.append(loc_mean)
+            self.sampled_loc_arr.append(loc)
+            self.glimpses.append(self.gl.glimpse)
+
+            return gl_next
+
+        def rnn_decoder(decoder_inputs, initial_state, cell, loop_function=None):
+
+            with tf.variable_scope("rnn_decoder"):
+                state = initial_state
+                outputs = []
+                prev = None
+
+                for i, inp in enumerate(decoder_inputs):
+                    if loop_function is not None and prev is not None:
+                        with tf.variable_scope("loop_function", reuse=tf.AUTO_REUSE):
+                            inp = loop_function(prev, i)
+
+                    if i > 0:
+                        tf.get_variable_scope().reuse_variables()
+
+                    output, state = cell(inp, state)
+                    outputs.append(output)
+
+                    if loop_function is not None:
+                        prev = output
+
+            return outputs, state
+
+        self.loc_mean_arr = [self.init_loc]
+        self.sampled_loc_arr = [self.init_loc]
+        self.glimpses = [self.gl.glimpse]
+
+        self.lstm_cell = self.rnn_cell.LSTMCell(self.config.cell_size, state_is_tuple=True, activation=tf.nn.tanh,
+                                                forget_bias=1.)
+        self.init_state = self.lstm_cell.zero_state(self.N, tf.float32)
+        self.outputs, self.rnn_state = rnn_decoder(self.inputs, self.init_state, self.lstm_cell,
+                                                   loop_function=get_next_input)
+
+        # ------- Classification -------
+
+        baselines = []
+        for t, output in enumerate(self.outputs):
+            with tf.variable_scope('baseline', reuse=tf.AUTO_REUSE):
+                baseline_t = tf.layers.dense(inputs=output, units=2, kernel_initializer=self.initializer)
+            baseline_t = tf.squeeze(baseline_t)
+            baselines.append(baseline_t)
+
+        baselines = tf.stack(baselines)
+        self.baselines = tf.transpose(baselines)
+
+        with tf.variable_scope('classification', reuse=tf.AUTO_REUSE):
+            self.class_prob_arr = []
+            for t, op in enumerate(self.outputs):
+                self.glimpse_logit = tf.layers.dense(inputs=op, units=self.config.num_classes,
+                                                     kernel_initializer=self.initializer,
+                                                     name='FCCN', reuse=tf.AUTO_REUSE)
+                self.glimpse_logit = tf.stop_gradient(self.glimpse_logit)
+                self.glimpse_logit = tf.nn.softmax(self.glimpse_logit)
+                self.class_prob_arr.append(self.glimpse_logit)
+            self.class_prob_arr = tf.stack(self.class_prob_arr, axis=1)
+
+        self.output = self.outputs[-1]
+        with tf.variable_scope('classification', reuse=tf.AUTO_REUSE):
+            self.logits = tf.layers.dense(inputs=self.output, units=self.config.num_classes,
+                                          kernel_initializer=self.initializer, name='FCCN',
+                                          reuse=tf.AUTO_REUSE)
+
+            self.softmax = tf.nn.softmax(self.logits)
+
+        self.sampled_locations = tf.concat(self.sampled_loc_arr, axis=0)
+        self.mean_locations = tf.concat(self.loc_mean_arr, axis=0)
+        self.sampled_locations = tf.reshape(self.sampled_locations, (self.config.num_glimpses, self.N, 2))
+        self.sampled_locations = tf.transpose(self.sampled_locations, [1, 0, 2])
+        self.mean_locations = tf.reshape(self.mean_locations, (self.config.num_glimpses, self.N, 2))
+        self.mean_locations = tf.transpose(self.mean_locations, [1, 0, 2])
+        prefix = tf.expand_dims(self.init_loc, 1)
+        self.sampled_locations = tf.concat([prefix, self.sampled_locations], axis=1)
+        self.mean_locations = tf.concat([prefix, self.mean_locations], axis=1)
+        self.glimpses = tf.stack(self.glimpses, axis=1)
+
+        # Losses/reward
+
+        def loglikelihood(mean_arr, sampled_arr, sigma):
+            mu = tf.stack(mean_arr)
+            sampled = tf.stack(sampled_arr)
+            gaussian = tf.contrib.distributions.Normal(mu, sigma)
+            logll = gaussian.log_prob(sampled)
+            logll = tf.reduce_sum(logll, 2)
+            logll = tf.transpose(logll)
+            return logll
+
+        self.xent = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=self.logits, labels=self.labels_ph)
+        self.xent = tf.reduce_mean(self.xent)
+
+        self.pred_labels = tf.argmax(self.logits, 1)
+        self.reward = tf.cast(tf.equal(self.pred_labels, self.labels_ph), tf.float32)
+        self.rewards = tf.expand_dims(self.reward, 1)
+        self.rewards = tf.tile(self.rewards, [1, self.config.num_glimpses])
+        self.logll = loglikelihood(self.loc_mean_arr, self.sampled_loc_arr, self.config.loc_std)
+        self.advs = self.rewards - tf.stop_gradient(self.baselines)
+        self.logllratio = tf.reduce_mean(self.logll * self.advs)
+
+        self.reward = tf.reduce_mean(self.reward)
+
+        self.baselines_mse = tf.reduce_mean(tf.square((self.rewards - self.baselines)))
+        self.var_list = tf.trainable_variables()
+
+        self.loss = -self.logllratio + self.xent + self.baselines_mse
+        self.grads = tf.gradients(self.loss, self.var_list)
+        self.grads, _ = tf.clip_by_global_norm(self.grads, self.config.max_grad_norm)
+
+        self.setup_optimization()
+
+        # session
+        self.session_config = tf.ConfigProto()
+        self.session_config.gpu_options.visible_device_list = self.config.gpu
+        #self.session_config.gpu_options.visible_device_list = '0'
+        self.session_config.gpu_options.allow_growth = True
+
+        print(self.session_config)
+        self.session = tf.Session(config=self.session_config)
+        self.session.run(tf.global_variables_initializer())
+
+    def setup_optimization(self):
+
+        # learning rate
+        self.global_step = tf.get_variable('global_step', [], initializer=tf.constant_initializer(0), trainable=False)
+
+        self.training_steps_per_epoch = int(len(self.generator.training_ids) // self.config.batch_size)
+        print('Training Step Per Epoch:', self.training_steps_per_epoch)
+
+        self.starter_learning_rate = self.config.lr_start
+        self.learning_rate = tf.train.exponential_decay(self.starter_learning_rate, self.global_step,
+                                                        self.training_steps_per_epoch, 0.70, staircase=False)
+        self.learning_rate = tf.maximum(self.learning_rate, self.config.lr_min)
+        self.optimizer = tf.train.MomentumOptimizer(self.learning_rate, momentum=0.90, use_nesterov=True)
+        # self.optimizer = tf.train.AdamOptimizer(self.learning_rate)
+        self.train_op = self.optimizer.apply_gradients(zip(self.grads, self.var_list), global_step=self.global_step)
+
+    def setup_logger(self):
+        """Creates log directory and initializes logger."""
+
+        self.summary_ops = {'reward': tf.summary.scalar('reward', self.reward),
+                            'hybrid_loss': tf.summary.scalar('hybrid_loss', self.loss),
+                            'cross_entropy': tf.summary.scalar('cross_entropy', self.xent),
+                            'baseline_mse': tf.summary.scalar('baseline_mse', self.baselines_mse),
+                            'logllratio': tf.summary.scalar('logllratio', self.logllratio),
+                            'lr': tf.summary.scalar('lr', self.learning_rate)}
+        # 'glimpses': tf.summary.image('glimpses',tf.reshape(self.glimpses,[-1,self.config.glimpse_size,
+        #                                                                  self.config.glimpse_size,
+        #                                                                 3]),max_outputs=8)}
+
+        self.eval_ops = {'labels': self.labels_ph, 'pred_labels': self.pred_labels, 'reward': self.reward,
+                         'hybrid_loss': self.loss, 'cross_entropy': self.xent, 'baseline_mse': self.baselines_mse,
+                         'logllratio': self.logllratio, 'lr': self.learning_rate}
+
+        self.logger = Logger(self.config.logdir, sess=self.session, summary_ops=self.summary_ops,
+                             global_step=self.global_step, eval_ops=self.eval_ops, n_verbose=self.config.n_verbose,
+                             var_list=self.var_list)
+
+    def train(self):
+
+        print('\n\n\n------------ Starting training ------------  \nT -- %s x %s \n' \
+              'Model:  %s glimpses, glimpse size %s x %s \n\n\n' % (
+                  self.config.input_shape, self.config.input_shape, self.config.num_glimpses, self.config.glimpse_size,
+                  self.config.glimpse_size))
+
+        self.setup_logger()
+
+        steps = []
+        lossLista = []
+
+        for i in range(self.config.steps + 1):
+
+            loc_dir_name = self.config.logdir + '/image/locations'
+            traj_dir_name = self.config.logdir + '/image/trajectories'
+            ROCs_dir_name = self.config.logdir + '/metrics/ROCs_AUCs/'
+            PRs_dir_name = self.config.logdir + '/metrics/PRs/'
+
+            if i == 0:
+                if os.path.exists(loc_dir_name):
+                    shutil.rmtree(loc_dir_name)
+                    os.makedirs(loc_dir_name)
+                else:
+                    os.makedirs(loc_dir_name)
+
+                if os.path.exists(traj_dir_name):
+                    shutil.rmtree(traj_dir_name)
+                    os.makedirs(traj_dir_name)
+                else:
+                    os.makedirs(traj_dir_name)
+
+                if os.path.exists(ROCs_dir_name):
+                    shutil.rmtree(ROCs_dir_name)
+                    os.makedirs(ROCs_dir_name)
+                else:
+                    os.makedirs(ROCs_dir_name)
+
+                if os.path.exists(PRs_dir_name):
+                    shutil.rmtree(PRs_dir_name)
+                    os.makedirs(PRs_dir_name)
+                else:
+                    os.makedirs(PRs_dir_name)
+
+            self.logger.step = i
+
+            images, labels = self.generator.generate(self.config.batch_size, self.generator.training_labels, self.generator.training_ids)
+
+            images = images.reshape((-1, self.config.input_shape, self.config.input_shape, 3))
+            labels = labels[0]
+            feed_dict = {self.images_ph: images, self.labels_ph: labels}
+
+            fetches = [self.output, self.rewards, self.reward, self.labels_ph, self.pred_labels, self.logits,
+                       self.train_op, self.loss, self.xent, self.baselines_mse, self.logllratio, self.learning_rate,
+                       self.loc_mean_arr]
+            output, rewards, reward, real_labels, pred_labels, logits, _, hybrid_loss, cross_entropy, baselines_mse, logllratio, lr, locations = self.session.run(
+                fetches, feed_dict)
+
+            steps.append(i)
+            lossLista.append(hybrid_loss)
+
+            if i % 1 == 0:
+
+                print('\n------ Step %s ------' % (i))
+                print('reward', reward)
+                print('labels', real_labels)
+                print('pred_labels', pred_labels)
+                print('hybrid_loss', hybrid_loss)
+                print('cross_entropy', cross_entropy)
+                print('baseline_mse', baselines_mse)
+                print('logllratio', logllratio)
+                print('lr', lr)
+                print('locations', locations[-1])
+                print('logits', logits)
+                self.logger.log('train', feed_dict=feed_dict)
+
+            if  i > 0 and i % 5 == 0:
+
+                #ACÁ VA EL EVAL
+                self.eval(i, feed_dict=feed_dict, real_labels=real_labels)
+
+
+            if i == self.config.steps:
+
+                fig = plt.figure()
+                plt.plot(steps, lossLista)
+                fig.suptitle('Steps vs. Hybrid Loss')
+                plt.xlabel('Steps')
+                plt.ylabel('Hybrid Loss')
+                plt.savefig("mygraph.png")
+
+                self.logger.save()
+                self.test(i)
+
+            # if i == self.config.steps:
+        # if i > 0 and i % 100 == 0:
+
+        #self.logger.save()
+
+    def eval(self, step, feed_dict, real_labels, loc_dir_name=None, traj_dir_name=None):
+        if loc_dir_name is None:
+            loc_dir_name = self.config.logdir + '/image/locations'
+        if traj_dir_name is None:
+            traj_dir_name = self.config.logdir + '/image/trajectories'
+        return self.evaluate(self.session, self.images_ph, self.labels_ph, self.softmax, step, feed_dict, real_labels, loc_dir_name, traj_dir_name)
+
+    def evaluate(self, sess, images_ph, labels_ph, softmax, step, feed_dict, real_labels, loc_dir_name=None, traj_dir_name=None):
+        if feed_dict is None:
+            feed_dict = {}  # Crea un feed_dict vacío si no se proporciona uno
+        print('Evaluating (%s x %s) using %s glimpses' % (
+            self.config.input_shape, self.config.input_shape, self.config.num_glimpses))
+
+        _num_examples = len(self.dataset._partition[0]['val'])
+        steps_per_epoch = _num_examples // self.config.eval_batch_size
+
+        y_scores = []
+        y_trues = []
+
+
+        for i in tqdm(iter(range(steps_per_epoch))):
+
+            self.X_val, self.y_val = self.generator.generate(self.config.eval_batch_size,
+                                                             self.generator.validation_labels,
+                                                             self.generator.validation_ids)
+            images, labels_val = self.X_val, self.y_val
+
+            self.id_val = self.generator.batch_ids
+
+
+            print("validation_ids:")
+            print(self.id_val)
+
+            print("images:")
+            print(images)
+            print("labels_val:")
+            print(labels_val)
+
+
+            glimpse_images = self.session.run(self.glimpses, feed_dict)
+            mean_locations = self.session.run(self.mean_locations, feed_dict)
+            probs = self.session.run(self.class_prob_arr, feed_dict)
+
+            plot_glimpses(config=self.config, glimpse_images=glimpse_images, pred_labels=self.pred_labels, probs=probs,
+                          sampled_loc=mean_locations, X=images, labels=real_labels, file_name=loc_dir_name, step=i,
+                          id_val=self.id_val, trainStep=step)
+
+            plot_trajectories(config=self.config, locations=mean_locations, X=images, labels=real_labels,
+                              pred_labels=self.pred_labels, file_name=traj_dir_name, step=i, trainStep=step)
+
+            # images = images.reshape((-1, self.config.input_shape, self.config.input_shape, 3))
+
+            softmax_val = sess.run(softmax, feed_dict={images_ph: images, labels_ph: labels_val[0]})
+
+
+
+            y_trues.extend(labels_val[0])
+            y_scores.extend(softmax_val)
+            print("dictfor:")
+            print(feed_dict)
+
+
+
+        print("dict:")
+        print(feed_dict)
+
+        self.logger.log('val', feed_dict=feed_dict)
+
+        y_trues = np.array(y_trues)  # Convierte a un arreglo numpy
+
+        y_scores = np.array(y_scores)
+
+        # Calculate y_preds based on y_scores
+        if np.ndim(y_scores) == 1:
+            y_preds = np.argmax(y_scores)
+        else:
+            y_preds = np.argmax(y_scores, axis=1)
+
+        # Apply patch_to_image to y_trues and y_scores
+        y_trues = self.patch_to_image(y_trues, proba=False)
+
+        y_scores = self.patch_to_image(y_scores, proba=True)
+
+        print('Validation Set', self.dataset._partition[0]['val'])
+        print(y_trues)
+        print(y_preds)
+
+        self.metrics_ROCs(y_trues, y_preds, y_scores, step)
+        self.metrics(y_trues, y_preds, step)
+        return
+
+    def count_params(self):
+        return self.count_parameters(self.session)
+
+    def count_parameters(self, sess):
+        variables_names = [v.name for v in tf.trainable_variables()]
+        values = sess.run(variables_names)
+        n_params = 0
+
+        for k, v in zip(variables_names, values):
+            print('-'.center(140, '-'))
+            print('%s \t Shape: %s \t %s parameters' % (k, v.shape, v.size))
+            n_params += v.size
+
+        print('-'.center(140, '-'))
+        print('Total # parameters:\t\t %s \n\n' % (n_params))
+        return n_params
+
+    def metrics_ROCs(self, y_trues, y_preds, y_scores, step, stage=None):
+
+        y_trues_binary = label_binarize(y_trues, classes=list(self.dataset.le_name_mapping.values()))
+        y_preds_binary = label_binarize(y_preds, classes=list(self.dataset.le_name_mapping.values()))
+        n_classes = y_preds_binary.shape[1]
+
+        y_trues = np.array(y_trues)
+        y_scores = np.array(y_scores)
+
+        print(y_trues.shape)
+        print(y_scores[:, 1].shape)
+
+        if stage == 'test':
+            fpr, tpr, _ = roc_curve(y_trues, y_scores)
+        else:
+            fpr, tpr, _ = roc_curve(y_trues, y_scores[:, 1])
+
+        roc_auc = auc(fpr, tpr)
+
+        plt.figure()
+
+        plt.plot(fpr, tpr, label='ROC curve (AUC = {0:0.2f})'''.format(roc_auc), color='navy', linestyle=':',
+                 linewidth=4)
+
+        plt.plot([0, 1], [0, 1], 'k--', lw=2)
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title('Receiving Operating Characteristic Curves')
+        plt.legend(loc="lower right")
+        plt.savefig(self.config.logdir + '/metrics/ROCs_AUCs/%i' % step)
+        return
+
+    def metrics(self, y_trues, y_preds, step):
+        #        y_trues_binary= label_binarize(y_trues, classes=list(self.dataset.le_name_mapping.values()))
+        #       y_preds_binary= label_binarize(y_preds, classes=list(self.dataset.le_name_mapping.values()))
+
+        accuracy = accuracy_score(y_trues, y_preds)
+        f1score = f1_score(y_trues, y_preds)
+        recall = recall_score(y_trues, y_preds)
+        precision = precision_score(y_trues, y_preds)
+        names = ['accuracy', 'f1_score', 'recall', 'precision']
+        pd.DataFrame(data=np.array([accuracy, f1score, recall, precision]), index=names).to_csv(
+            self.config.logdir + '/metrics/metrics_%i.csv' % step)
+        return
+
+    def load(self, checkpoint_dir):
+        folder = os.path.join(checkpoint_dir, 'checkpoints')
+        print('\nLoading model from <<{}>>.\n'.format(folder))
+
+        self.saver = tf.train.Saver(self.var_list)
+        ckpt = tf.train.get_checkpoint_state(folder)
+
+        if ckpt and ckpt.model_checkpoint_path:
+            print(ckpt)
+            self.saver.restore(self.session, "/home/proyreinforce/PycharmProjects/pythonProject/logger/checkpoints/checkpoint-3001")
+
+    def patch_to_image(self, y_patches, proba=True):
+
+        if proba == True:
+            y_image = np.array(
+                [np.mean(y_patches[i * self.config.sampling_size_test:(i + 1) * self.config.sampling_size_test], axis=0)
+                 for i in range(int(len(y_patches) / self.config.sampling_size_test))])
+
+        else:
+            y_image = np.array(
+                [np.mean(y_patches[i * self.config.sampling_size_test:(i + 1) * self.config.sampling_size_test]) > 0.5
+                 for i in range(int(len(y_patches) / self.config.sampling_size_test))]).reshape((-1, 1)).astype(int)
+            y_image = np.asarray(y_image.flatten())
+        return y_image
+
+    def test(self, step):
+        return self.testing(self.session, self.images_ph, self.labels_ph, self.softmax, step)
+
+    def testing(self, sess, images_ph, labels_ph, softmax, step):
+        print('Testing (%s x %s) using %s glimpses' % (
+            self.config.input_shape, self.config.input_shape, self.config.num_glimpses))
+
+        _num_examples = len(self.dataset._partition[0]['test'])
+        steps_per_epoch = _num_examples // self.config.test_batch_size
+
+        y_scores = []
+        y_trues = []
+
+        for i in tqdm(iter(range(steps_per_epoch))):
+
+            self.X_test, self.y_test = self.generator.generate(self.config.test_batch_size, self.generator.test_labels,
+                                                               self.generator.test_ids)
+            images, labels_test = self.X_test, self.y_test
+
+            print("images:")
+            print(images)
+            print("labels_test:")
+            print(labels_test)
+
+            # images = images.reshape((-1, self.config.input_shape, self.config.input_shape, 3))
+
+            softmax_test = sess.run(softmax, feed_dict={images_ph: images, labels_ph: labels_test[0]})
+
+            y_trues.extend(labels_test[0])
+            y_scores.extend(softmax_test)
+
+        y_trues = np.array(y_trues)  # Convierte a un arreglo numpy
+
+        y_scores = np.array(y_scores)
+
+        # Calculate y_preds based on y_scores
+        if np.ndim(y_scores) == 1:
+            y_preds = np.argmax(y_scores)
+        else:
+            y_preds = np.argmax(y_scores, axis=1)
+
+        # Apply patch_to_image to y_trues and y_scores
+        y_trues = self.patch_to_image(y_trues, proba=False)
+
+        y_scores = self.patch_to_image(y_scores, proba=True)
+
+        print('Test Set', self.dataset._partition[0]['test'])
+        print(y_trues)
+        print(y_preds)
+
+        self.metrics_ROCs(y_trues, y_preds, y_scores, step)
+        self.metrics(y_trues, y_preds, step)
+        return
+
+
+
+
+import tensorflow as tf
+config  = Config()
+#tf.reset_default_graph()
+model = DRAM(config)
+#model.load("/home/proyreinforce/PycharmProjects/pythonProject/logger")
+model.count_params()
+model.train()
